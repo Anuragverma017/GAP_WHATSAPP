@@ -16,6 +16,8 @@ import {
     CheckCircle2,
     BadgeInfo,
     StickyNote,
+    UserPlus,
+    RefreshCw,
 } from 'lucide-react'
 import { format } from 'date-fns'
 import { useAuth } from '../context/AuthContext'
@@ -203,6 +205,9 @@ export default function ContactProfileDrawer({
     const [flowSession, setFlowSession] = useState(null)
     const [handoffSummary, setHandoffSummary] = useState(null)
     const [summaryMeta, setSummaryMeta] = useState(null)
+    const [summaryError, setSummaryError] = useState('')
+    const [isRequestingSummary, setIsRequestingSummary] = useState(false)
+    const [isSavingContact, setIsSavingContact] = useState(false)
 
     const aliasInputRef = useRef(null)
     const autoSavedKeyRef = useRef('')
@@ -256,6 +261,8 @@ export default function ContactProfileDrawer({
         })
     }, [customFields])
 
+    const isContactSaved = Boolean(contact?.saved_at || contact?.save_source === 'manual' || contact?.save_source === 'import' || contact?.save_source === 'broadcast')
+
     const patchContact = useCallback(async (payload) => {
         const id = contact?.id
         if (!id) throw new Error('Contact is not synced yet.')
@@ -280,6 +287,19 @@ export default function ContactProfileDrawer({
             },
         })
     }, [customFields, patchContact])
+
+    const fetchSummary = useCallback(async () => {
+        if (!conversationId) return null
+        const res = await apiCall(`${API_BASE}/conversations/${conversationId}/summary`)
+        if (!res.ok) {
+            const body = await res.text().catch(() => '')
+            throw new Error(body || `Failed to fetch summary (HTTP ${res.status})`)
+        }
+        const data = await res.json().catch(() => null)
+        setHandoffSummary(data?.summary || null)
+        setSummaryMeta(data?.conversation || null)
+        return data
+    }, [apiCall, conversationId])
 
     useEffect(() => {
         setCustomName(String(contact?.custom_name || ''))
@@ -306,17 +326,20 @@ export default function ContactProfileDrawer({
             return
         }
 
-        apiCall(`${API_BASE}/conversations/${conversationId}/summary`)
-            .then((res) => res.ok ? res.json() : null)
-            .then((data) => {
-                setHandoffSummary(data?.summary || null)
-                setSummaryMeta(data?.conversation || null)
-            })
-            .catch((err) => console.error('Error fetching handoff summary', err))
-    }, [apiCall, conversationId, isOpen])
+        setSummaryError('')
+        fetchSummary().catch((err) => console.error('Error fetching handoff summary', err))
+    }, [conversationId, fetchSummary, isOpen])
 
     useEffect(() => {
-        if (!isOpen || !contact?.id) return
+        if (!isOpen || !conversationId || summaryMeta?.summary_status !== 'pending') return
+        const timer = setInterval(() => {
+            fetchSummary().catch((err) => console.error('Error refreshing handoff summary', err))
+        }, 3000)
+        return () => clearInterval(timer)
+    }, [conversationId, fetchSummary, isOpen, summaryMeta?.summary_status])
+
+    useEffect(() => {
+        if (!isOpen || !contact?.id || !isContactSaved) return
 
         const fieldsPatch = {}
         if (extractedInfo.email && customFields.captured_email !== extractedInfo.email) fieldsPatch.captured_email = extractedInfo.email
@@ -347,7 +370,7 @@ export default function ContactProfileDrawer({
                 console.error('Failed to auto-save contact insights', err)
                 setAutoSaveStatus('Auto-save failed')
             })
-    }, [isOpen, contact?.id, extractedInfo, displayInsights, customFields, patchCustomFields])
+    }, [isOpen, contact?.id, isContactSaved, extractedInfo, displayInsights, customFields, patchCustomFields])
 
     useEffect(() => {
         if (!isOpen || !focusAliasOnOpen) return
@@ -405,6 +428,47 @@ export default function ContactProfileDrawer({
         }
     }
 
+    const saveContact = async () => {
+        if (!contact?.id) return
+        setIsSavingContact(true)
+        setSaveError('')
+        try {
+            const res = await apiCall(`${API_BASE}/contacts/${contact.id}/save`, { method: 'POST' })
+            if (!res.ok) {
+                const body = await res.text().catch(() => '')
+                throw new Error(body || `Failed to save contact (HTTP ${res.status})`)
+            }
+            const updated = await res.json().catch(() => null)
+            if (updated && typeof onContactUpdated === 'function') onContactUpdated(updated)
+        } catch (e) {
+            setSaveError(e?.message || 'Failed to save contact')
+        } finally {
+            setIsSavingContact(false)
+        }
+    }
+
+    const requestSummary = async () => {
+        if (!conversationId) return
+        setIsRequestingSummary(true)
+        setSummaryError('')
+        try {
+            const res = await apiCall(`${API_BASE}/conversations/${conversationId}/request-summary`, { method: 'POST' })
+            if (!res.ok) {
+                const body = await res.text().catch(() => '')
+                throw new Error(body || `Failed to request summary (HTTP ${res.status})`)
+            }
+            const data = await res.json().catch(() => null)
+            setSummaryMeta(data?.conversation || { ...(summaryMeta || {}), summary_status: 'pending' })
+            setTimeout(() => {
+                fetchSummary().catch((err) => console.error('Error fetching requested summary', err))
+            }, 1200)
+        } catch (e) {
+            setSummaryError(e?.message || 'Failed to request summary')
+        } finally {
+            setIsRequestingSummary(false)
+        }
+    }
+
     if (!isOpen || !contact) return null
 
     const heatClass = displayInsights.temperature === 'Hot'
@@ -455,6 +519,17 @@ export default function ContactProfileDrawer({
                             <h3 className="mt-4 text-2xl font-semibold text-gray-900">{displayName}</h3>
                             <div className="mt-1 text-sm text-gray-500 font-mono">{phoneDisplay || 'No phone'}</div>
                             <div className="mt-4 flex flex-wrap justify-center gap-2">
+                                {!isContactSaved ? (
+                                    <button
+                                        type="button"
+                                        onClick={saveContact}
+                                        disabled={isSavingContact}
+                                        className="inline-flex items-center gap-1 rounded-full border border-green-200 bg-green-50 px-3 py-1 text-xs font-semibold text-green-700 hover:bg-green-100 disabled:opacity-60"
+                                    >
+                                        <UserPlus className="h-3.5 w-3.5" />
+                                        {isSavingContact ? 'Saving contact' : 'Save contact'}
+                                    </button>
+                                ) : null}
                                 <span className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-semibold ${heatClass}`}>
                                     <Flame className="h-3.5 w-3.5" />
                                     {displayInsights.temperature} lead
@@ -635,11 +710,23 @@ export default function ContactProfileDrawer({
                                                         : 'Condensed from recent messages for the sales executive.'}
                                             </p>
                                         </div>
-                                        <span className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-semibold ${heatClass}`}>
-                                            <Flame className="h-3.5 w-3.5" />
-                                            {displayInsights.score}/100
-                                        </span>
+                                        <div className="flex flex-col items-end gap-2">
+                                            <span className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-semibold ${heatClass}`}>
+                                                <Flame className="h-3.5 w-3.5" />
+                                                {displayInsights.score}/100
+                                            </span>
+                                            <button
+                                                type="button"
+                                                onClick={requestSummary}
+                                                disabled={!conversationId || isRequestingSummary || summaryMeta?.summary_status === 'pending'}
+                                                className="inline-flex items-center gap-1 rounded-lg border border-green-200 bg-green-50 px-3 py-1.5 text-xs font-semibold text-green-700 hover:bg-green-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                            >
+                                                <RefreshCw className={`h-3.5 w-3.5 ${isRequestingSummary || summaryMeta?.summary_status === 'pending' ? 'animate-spin' : ''}`} />
+                                                {summaryMeta?.summary_status === 'pending' ? 'Generating' : handoffSummary ? 'Regenerate' : 'Generate summary'}
+                                            </button>
+                                        </div>
                                     </div>
+                                    {summaryError ? <div className="mt-3 text-xs text-red-600">{summaryError}</div> : null}
                                     <div className="mt-4 h-2 rounded-full bg-gray-100">
                                         <div className="h-2 rounded-full bg-green-500" style={{ width: `${displayInsights.score}%` }} />
                                     </div>

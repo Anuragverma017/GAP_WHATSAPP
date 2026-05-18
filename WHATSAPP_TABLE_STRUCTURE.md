@@ -35,13 +35,14 @@ Do not rely on `content.bot_agent_id` for reporting. It may exist for backward c
 
 ## n8n Handoff Summary
 
-Backend webhook mode is the preferred flow now:
+Manual webhook mode is the preferred flow now:
 
 1. Set backend env `N8N_HANDOFF_WEBHOOK_URL` to the n8n Webhook node URL.
 2. Optional but recommended: set `N8N_WEBHOOK_SECRET`.
-3. When a Flow Builder `handoff` node runs, backend posts `flow_handoff_requested` to n8n.
-4. n8n generates the summary from the included `messages`.
-5. n8n posts the result back to `callback_url`.
+3. Executive opens the LiveChat contact drawer and clicks `Generate summary`.
+4. Backend marks `w_conversations.summary_status = 'pending'` and posts `manual_summary_requested` to n8n.
+5. n8n generates the summary from the included `messages`.
+6. n8n posts the result back to `callback_url`.
 
 Callback request:
 

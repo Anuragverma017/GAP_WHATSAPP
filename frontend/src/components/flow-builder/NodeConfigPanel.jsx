@@ -243,14 +243,6 @@ function HandoffConfig({ config, updateConfig }) {
             <label className="flex items-center gap-2 text-sm text-gray-700">
                 <input
                     type="checkbox"
-                    checked={config.summaryRequired !== false}
-                    onChange={(e) => updateConfig('summaryRequired', e.target.checked)}
-                />
-                Request n8n summary
-            </label>
-            <label className="flex items-center gap-2 text-sm text-gray-700">
-                <input
-                    type="checkbox"
                     checked={config.disableBotAfterHandoff !== false}
                     onChange={(e) => updateConfig('disableBotAfterHandoff', e.target.checked)}
                 />

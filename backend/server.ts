@@ -1406,7 +1406,7 @@ async function upsertContact(organization_id: string, wa_account_id: string, wa_
     if (wa_key) {
         const { data, error } = await supabase
             .from('w_contacts')
-            .select('id,name,custom_name,phone,wa_id,wa_key,created_at,custom_fields')
+            .select('id,name,custom_name,phone,wa_id,wa_key,created_at,custom_fields,saved_at,saved_by_user_id,save_source')
             .eq('organization_id', organization_id)
             .eq('wa_key', wa_key);
         if (error) throw error;
@@ -1416,7 +1416,7 @@ async function upsertContact(organization_id: string, wa_account_id: string, wa_
     if (!candidates.length) {
         const { data, error } = await supabase
             .from('w_contacts')
-            .select('id,name,custom_name,phone,wa_id,wa_key,created_at,custom_fields')
+            .select('id,name,custom_name,phone,wa_id,wa_key,created_at,custom_fields,saved_at,saved_by_user_id,save_source')
             .eq('organization_id', organization_id)
             .eq('wa_id', wa_id)
             .limit(10);
@@ -1500,6 +1500,7 @@ async function upsertContact(organization_id: string, wa_account_id: string, wa_
         wa_key: wa_key || null,
         phone: maybePhone,
         contact_type,
+        save_source: 'auto',
     };
 
     if (profilePhotoUrl) {
@@ -2104,12 +2105,14 @@ async function triggerHandoffWebhook(params: {
     organization_id: string;
     conversation_id: string;
     contact_id: string;
+    event?: string;
     flow_id?: string | null;
     flow_version_id?: string | null;
     flow_session_id?: string | null;
     flow_run_id?: string | null;
     flow_node_id?: string | null;
     handoff_reason?: string | null;
+    requested_by_user_id?: string | null;
     summary_required?: boolean;
     state_data?: any;
     selected_text?: string | null;
@@ -2150,7 +2153,7 @@ async function triggerHandoffWebhook(params: {
         }));
 
         const payload = {
-            event: 'flow_handoff_requested',
+            event: params.event || 'manual_summary_requested',
             organization_id: params.organization_id,
             conversation_id: params.conversation_id,
             contact_id: params.contact_id,
@@ -2161,7 +2164,8 @@ async function triggerHandoffWebhook(params: {
             flow_node_id: params.flow_node_id || null,
             trigger_message_id: params.trigger_message_id || null,
             selected_text: params.selected_text || null,
-            handoff_reason: params.handoff_reason || 'Flow requested human handoff',
+            requested_by_user_id: params.requested_by_user_id || null,
+            handoff_reason: params.handoff_reason || 'Manual summary requested',
             state_data: params.state_data || {},
             summary_required: true,
             callback_url: `${PUBLIC_BASE_URL}/api/n8n/conversations/${params.conversation_id}/summary`,
@@ -2584,27 +2588,12 @@ async function processFlowEngine(organization_id: string, contact_id: string, co
                 handoff_status: 'handoff_requested',
                 handoff_reason: config.reason || 'Flow requested human handoff',
                 handoff_requested_at: new Date().toISOString(),
-                summary_status: config.summaryRequired === false ? 'not_started' : 'pending',
+                summary_status: 'not_started',
             };
             if (config.disableBotAfterHandoff !== false) conversationPatch.bot_enabled = false;
             await supabase.from('w_conversations').update(conversationPatch).eq('id', conversation_id);
             await supabase.from('w_flow_sessions').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', session_id);
             if (run_id) await supabase.from('w_flow_runs').update({ status: 'completed', ended_at: new Date().toISOString() }).eq('id', run_id);
-            triggerHandoffWebhook({
-                organization_id,
-                conversation_id,
-                contact_id,
-                flow_id: flowMeta.flow_id,
-                flow_version_id: flowMeta.flow_version_id,
-                flow_session_id: flowMeta.flow_session_id,
-                flow_run_id: flowMeta.flow_run_id,
-                flow_node_id: activeNode.id,
-                handoff_reason: conversationPatch.handoff_reason,
-                summary_required: config.summaryRequired !== false,
-                state_data: flowState,
-                selected_text: text,
-                trigger_message_id: triggerMessageId || null,
-            }).catch((err) => console.error('[n8n] Handoff webhook failed:', err?.message || err));
             return { consumed: true, output: renderFlowTemplate(handoffMessage, flowState) || null, handoff: true, ...flowMeta, flow_node_id: activeNode.id };
         }
 
@@ -2844,7 +2833,7 @@ app.get("/api/conversations", authMiddleware, async (req: any, res) => {
             .from('w_conversations')
             .select(`
                 *,
-                contact:w_contacts(id, name, custom_name, phone, wa_id, wa_key, created_at, tags, custom_fields)
+                contact:w_contacts(id, name, custom_name, phone, wa_id, wa_key, created_at, tags, custom_fields, saved_at, saved_by_user_id, save_source)
             `)
             .eq("organization_id", organization_id)
             .order("last_message_at", { ascending: false });
@@ -2993,6 +2982,7 @@ app.get("/api/conversations", authMiddleware, async (req: any, res) => {
 app.get('/api/contacts', authMiddleware, async (req: any, res) => {
     const organization_id = req.organization_id;
     const includeGroups = req.query.include_groups === 'true';
+    const includeUnsaved = req.query.include_unsaved === 'true';
     
     if (!organization_id) {
         return res.status(403).json({ error: 'No organization linked to this account' });
@@ -3001,13 +2991,17 @@ app.get('/api/contacts', authMiddleware, async (req: any, res) => {
     try {
         let query = supabase
             .from('w_contacts')
-            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type')
+            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type, saved_at, saved_by_user_id, save_source')
             .eq('organization_id', organization_id)
             .order('created_at', { ascending: false });
 
         // By default, only show individual w_contacts (not groups/channels)
         if (!includeGroups) {
             query = query.or('contact_type.eq.individual,contact_type.is.null');
+        }
+
+        if (!includeUnsaved) {
+            query = query.not('saved_at', 'is', null);
         }
 
         let { data, error } = await query;
@@ -3094,9 +3088,12 @@ app.post('/api/contacts', authMiddleware, async (req: any, res) => {
                 wa_key,
                 tags: normalizedTags,
                 custom_fields: normalizedCustomFields,
-                contact_type: 'individual'
+                contact_type: 'individual',
+                saved_at: new Date().toISOString(),
+                saved_by_user_id: req.user?.id || null,
+                save_source: 'manual'
             })
-            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type')
+            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type, saved_at, saved_by_user_id, save_source')
             .single();
         if (error) throw error;
 
@@ -3202,7 +3199,7 @@ app.patch('/api/contacts/:id', authMiddleware, async (req: any, res) => {
             .from('w_contacts')
             .update(updates)
             .eq('id', contactId)
-            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type')
+            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type, saved_at, saved_by_user_id, save_source')
             .single();
         if (updErr) throw updErr;
 
@@ -3211,6 +3208,46 @@ app.patch('/api/contacts/:id', authMiddleware, async (req: any, res) => {
     } catch (err: any) {
         console.error('Error updating contact:', err);
         res.status(500).json({ error: err.message || 'Failed to update contact' });
+    }
+});
+
+app.post('/api/contacts/:id/save', authMiddleware, async (req: any, res) => {
+    const contactId = req.params.id;
+    const organization_id = req.organization_id;
+
+    try {
+        if (!organization_id) {
+            return res.status(400).json({ error: 'organization_id is required' });
+        }
+
+        const { data: existing, error: findErr } = await supabase
+            .from('w_contacts')
+            .select('id, organization_id, saved_at')
+            .eq('id', contactId)
+            .maybeSingle();
+        if (findErr) throw findErr;
+        if (!existing?.id) return res.status(404).json({ error: 'Contact not found' });
+        if (existing.organization_id !== organization_id) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const { data: updated, error: updErr } = await supabase
+            .from('w_contacts')
+            .update({
+                saved_at: existing.saved_at || new Date().toISOString(),
+                saved_by_user_id: req.user?.id || null,
+                save_source: 'manual',
+            })
+            .eq('id', contactId)
+            .select('id, name, custom_name, phone, wa_id, wa_key, wa_account_id, tags, custom_fields, created_at, last_active, contact_type, saved_at, saved_by_user_id, save_source')
+            .single();
+        if (updErr) throw updErr;
+
+        io.emit('contact_updated', { contact: updated });
+        res.json(updated);
+    } catch (err: any) {
+        console.error('Error saving contact:', err);
+        res.status(500).json({ error: err.message || 'Failed to save contact' });
     }
 });
 
@@ -4549,6 +4586,63 @@ app.get('/api/conversations/:id/summary', authMiddleware, async (req: any, res) 
     } catch (err: any) {
         console.error('Error fetching conversation summary:', err);
         res.status(500).json({ error: err.message || 'Failed to fetch summary' });
+    }
+});
+
+app.post('/api/conversations/:id/request-summary', authMiddleware, async (req: any, res) => {
+    const conversationId = req.params.id;
+    const orgId = req.organization_id;
+
+    try {
+        const { data: conversation, error: convErr } = await supabase
+            .from('w_conversations')
+            .select('id, organization_id, contact_id, handoff_status')
+            .eq('id', conversationId)
+            .eq('organization_id', orgId)
+            .maybeSingle();
+        if (convErr) throw convErr;
+        if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+        if (!N8N_HANDOFF_WEBHOOK_URL) {
+            return res.status(400).json({ error: 'N8N_HANDOFF_WEBHOOK_URL is not configured' });
+        }
+
+        await supabase
+            .from('w_conversations')
+            .update({
+                summary_status: 'pending',
+                handoff_status: conversation.handoff_status === 'bot_active' ? 'handoff_requested' : conversation.handoff_status,
+                handoff_reason: 'Manual summary requested',
+                handoff_requested_at: new Date().toISOString(),
+            })
+            .eq('id', conversationId)
+            .eq('organization_id', orgId);
+
+        await triggerHandoffWebhook({
+            event: 'manual_summary_requested',
+            organization_id: orgId,
+            conversation_id: conversationId,
+            contact_id: conversation.contact_id,
+            handoff_reason: 'Manual summary requested',
+            requested_by_user_id: req.user?.id || null,
+            summary_required: true,
+        });
+
+        const { data: latestConversation } = await supabase
+            .from('w_conversations')
+            .select('id, handoff_status, handoff_reason, handoff_requested_at, summary_status, latest_summary_id')
+            .eq('id', conversationId)
+            .eq('organization_id', orgId)
+            .maybeSingle();
+
+        io.to(`org:${orgId}`).emit('conversation_summary_updated', {
+            conversation_id: conversationId,
+            summary_status: latestConversation?.summary_status || 'pending',
+        });
+
+        res.json({ success: true, conversation: latestConversation || null });
+    } catch (err: any) {
+        console.error('[n8n] Error requesting summary:', err);
+        res.status(500).json({ error: err.message || 'Failed to request summary' });
     }
 });
 
